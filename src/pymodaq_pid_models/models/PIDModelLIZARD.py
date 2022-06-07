@@ -39,7 +39,7 @@ class PIDModelLIZARD(PIDModelGeneric):
              'children': [
                 {'title': 'Start pos:', 'name': 'start', 'type': 'float', 'value': -10040.},
                 {'title': 'Stop pos:', 'name': 'stop', 'type': 'float', 'value': -10041.},
-                {'title': 'Number of steps:', 'name': 'Nstep', 'type': 'int', 'value': 10},
+                {'title': 'Number of steps:', 'name': 'Nstep', 'type': 'int', 'value': 11},
                 {'title': 'Averaging:', 'name': 'average', 'type': 'int', 'value': 1}]},
             {'title': 'Ellipse params', 'name': 'calibration_ellipse', 'type': 'group', 'expanded': False,
              'visible': True, 'children': [
@@ -114,7 +114,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         self.phase_buffer = np.array([])
 
         self.delay_line_absolute_position = 0
-        #self.setpoint = 0
+        self.current_setpoint = 0
         self.error = 0
 
         self.log_spectrum_node_initialized = False
@@ -197,7 +197,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         # Any unread response currently in the device output buffer will be cleared. See Lecroy ActiveDSO Developer’s
         # Guide.
         # SPECIFIC TO THE SCOPE WE USE
-        scope_module.controller.DeviceClear(False)
+        # scope_module.controller.DeviceClear(False)
 
         QtWidgets.QApplication.processEvents()
         QThread.msleep(1000)
@@ -213,7 +213,8 @@ class PIDModelLIZARD(PIDModelGeneric):
             self.wait_for_det_done()
 
             raw_spectrum_from_scope = []
-            raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Lecroy Waverunner_CH000']['data']
+            #raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Lecroy Waverunner_CH000']['data']
+            raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Mock1_CH000']['data']
 
             QtWidgets.QApplication.processEvents()
             QThread.msleep(300)
@@ -325,43 +326,97 @@ class PIDModelLIZARD(PIDModelGeneric):
 
         return ellipse_x, ellipse_y
 
-    def convert_input(self, measurements):
-        """
-        Convert the measurements in the units to be fed to the PID (same dimensionality as the setpoint)
+    def convert_input(self, data):
+        """ Return a measured phase (delay) from the oscilloscope spectrum
+
+        Convert the measurements from the ROIs in the electronic spectrum to a measured phase in rad (same
+        dimensionality as the setpoint). The output feeds the PID module (external library).
 
         Parameters
         ----------
-        measurements: (Ordereddict) Ordereded dict of object from which the model extract a value of the same units as the setpoint
+        data: (dict) Dictionary from which the current spectrum is extracted
 
         Returns
         -------
-        float: the converted input
-
+        (InputFromDetector) Stores the unwrapped phase in radians. The origin of the phase axis is the phase at time
+            zero.
         """
-        # print('input conversion done')
-        image = measurements['Camera']['data2D']['Camera_Mock2DPID_CH000']['data']
-        image = image - self.settings.child('threshold').value()
-        image[image < 0] = 0
-        x, y = center_of_mass(image)
-        self.curr_input = [y, x]
-        return InputFromDetector([y, x])
+        # Spectrum from the oscilloscope
+        raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Mock1_CH000']['data']
 
-    def convert_output(self, outputs, dt, stab=True):
-        """
-        Convert the output of the PID in units to be fed into the actuator
+        scope_viewer = self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.viewers[0]
+        # The signal offset is taken from ROI_02 (mean value), which should be out of any electron signal.
+        signal_offset = scope_viewer.measure_data_dict['Lineout_ROI_02:']
+        spectrum_without_offset = [elt - signal_offset for elt in raw_spectrum_from_scope]
+
+        # The XUV flux normalization corresponds to the integral of the all spectrum (i.e. the total number of
+        # photoelectrons).
+        # Dividing by this value, we suppress the effect of the fluctuations of the intensity of the XUV source.
+        xuv_flux_normalization = np.trapz(spectrum_without_offset)
+
+        # Measurement from ROI_00 (mean value). Correspond to the value of the first modulated signal m1.
+        raw_m1 = scope_viewer.measure_data_dict['Lineout_ROI_00:']
+        m1 = (raw_m1 - signal_offset)/xuv_flux_normalization
+        # Measurement from ROI_01 (mean value). Correspond to the value of the second modulated signal m2.
+        raw_m2 = scope_viewer.measure_data_dict['Lineout_ROI_01:']
+        m2 = (raw_m2 - signal_offset)/xuv_flux_normalization
+
+        # The phase returned by get_phi_from_xy is within [-pi, +pi].
+        phi = self.get_phi_from_xy(m1, m2)
+
+        # The first call of convert_input method is done after the user push the PLAY button (launch of the PID loop).
+        # It should be done just after the calibration scan. Which means that we are at time zero.
+        # That is how we define the phase at time zero.
+        if not self.time_zero_phase_defined:
+            self.time_zero_phase = phi
+            self.settings.child('stabilization', 'offsets', 'time_zero_phase').setValue(self.time_zero_phase)
+            self.time_zero_phase_defined = True
+
+        # Record the measured phases. The phases in self.phase_buffer should be within [-pi,+pi].
+        self.phase_buffer = np.append(self.phase_buffer, [phi])
+
+        # Perform the unwrap operation and offset by time_zero_phase. Thus delay_phase is zero at time zero.
+        phase_buffer_unwrapped = np.unwrap(self.phase_buffer - self.time_zero_phase)
+        unwrapped_phase = phase_buffer_unwrapped[-1]
+        self.delay_phase = unwrapped_phase
+
+        return InputFromDetector([unwrapped_phase])
+
+    def convert_output(self, phase_correction):
+        """ Convert the phase correction from the PID module to an order in absolute value for the actuator.
+
         Parameters
         ----------
-        output: (float) output value from the PID from which the model extract a value of the same units as the actuator
+        phase_correction: (float) output value from the PID module. This phase correction in radians should be within
+        [-pi,+pi].
 
         Returns
         -------
-        list: the converted output as a list (if there are a few actuators)
-
+        (OutputToActuator) Stores the absolute value in microns for the piezo actuator.
         """
-        # print('output converted')
+        # Laser wavelength in microns
+        laser_wl = self.settings.child('stabilization', 'laser_wl').value()
+        # This parameter is used to easily change the sign of the correction on the fly, while the feedback loop is
+        # running
+        correction_sign = self.settings.child('stabilization', 'correction_sign').value()
 
-        self.curr_output = outputs
-        return OutputToActuator(mode='rel', values=outputs)
+        # Get the current position of the actuator
+        self.delay_line_absolute_position = self.pid_controller.actuator_modules[0].current_position
+
+        absolute_order_to_actuator = (self.delay_line_absolute_position
+                                      + correction_sign*phase_correction*laser_wl/(8*np.pi))
+
+        self.settings.child('stabilization', 'delay_line_absolute_position').setValue(self.delay_line_absolute_position)
+
+        # Get the value of the error (in rad)
+        self.current_setpoint = self.pid_controller.settings.child('main_settings', 'pid_controls', 'set_point').value()
+        self.error = self.delay_phase - self.current_setpoint
+        self.settings.child('stabilization', 'error').setValue(self.error)
+
+        self.settings.child('stabilization', 'relative_order_to_actuator').setValue(
+            absolute_order_to_actuator - self.delay_line_absolute_position)
+
+        return OutputToActuator(mode="abs", values=[absolute_order_to_actuator])
 
 
 if __name__ == '__main__':
