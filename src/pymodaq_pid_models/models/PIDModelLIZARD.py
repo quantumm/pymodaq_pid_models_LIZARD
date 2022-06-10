@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 import numpy as np
 from collections import OrderedDict
+import logging
 
 
 class PIDModelLIZARD(PIDModelGeneric):
@@ -39,7 +40,7 @@ class PIDModelLIZARD(PIDModelGeneric):
              'children': [
                 {'title': 'Start pos:', 'name': 'start', 'type': 'float', 'value': -10040.},
                 {'title': 'Stop pos:', 'name': 'stop', 'type': 'float', 'value': -10041.},
-                {'title': 'Number of steps:', 'name': 'Nstep', 'type': 'int', 'value': 11},
+                {'title': 'Number of steps:', 'name': 'Nstep', 'type': 'int', 'value': 6},
                 {'title': 'Averaging:', 'name': 'average', 'type': 'int', 'value': 1}]},
             {'title': 'Ellipse params', 'name': 'calibration_ellipse', 'type': 'group', 'expanded': False,
              'visible': True, 'children': [
@@ -47,8 +48,7 @@ class PIDModelLIZARD(PIDModelGeneric):
                  {'title': 'Dy:', 'name': 'dy', 'type': 'float', 'value': 0.0},
                  {'title': 'x0:', 'name': 'x0', 'type': 'float', 'value': 0.00},
                  {'title': 'y0:', 'name': 'y0', 'type': 'float', 'value': 0.00},
-                 {'title': 'theta (°):', 'name': 'theta', 'type': 'float','value': 0.00}
-            ]}
+                 {'title': 'theta (°):', 'name': 'theta', 'type': 'float', 'value': 0.00}]}
          ]},
         {'title': 'Stabilized scan', 'name': 'stabilized_scan', 'type': 'group', 'expanded': False, 'visible': True,
          'children': [
@@ -58,10 +58,12 @@ class PIDModelLIZARD(PIDModelGeneric):
              'expanded': False, 'visible': True, 'children': [
                 {'title': 'Length (microns):', 'name': 'length', 'type': 'float', 'value': 1},
                 {'title': 'Step size (microns):', 'name': 'step_size', 'type': 'float', 'value': 0.02},
-                {'title': 'Iterations per setpoint:', 'name': 'iterations_per_setpoint', 'type': 'int', 'value': 2}
-            ]}
+                {'title': 'Iterations per setpoint:', 'name': 'iterations_per_setpoint', 'type': 'int', 'value': 2}]}
          ]}
     ]
+
+    detectors_name = ["Scope"]
+    actuators_name = ["Delay line"]
 
     def __init__(self, pid_controller):
         super().__init__(pid_controller)
@@ -119,6 +121,8 @@ class PIDModelLIZARD(PIDModelGeneric):
 
         self.log_spectrum_node_initialized = False
 
+        self.logger = logging.getLogger("pymodaq.pid_controller")
+
     def update_settings(self, param):
         """ Get a parameter instance whose value has been modified by the user on the UI
 
@@ -161,8 +165,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         # The name should correspond to the one given in the preset.
         self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.grab_pb.click()
 
-        # Load ROI configuration file
-        self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.viewers[0].roi_manager.load_ROI()
+        self.logger.info("LIZARD PIDModel initialized")
 
     def start_calibration(self):
         """ Launch a calibration scan
@@ -177,7 +180,10 @@ class PIDModelLIZARD(PIDModelGeneric):
         The phase at time zero is also set.
         At the end of the scan the delay line returns to the time zero (the start position).
         """
-        #self.pid_controller.log_signal.emit('A calibration scan has been launched !')
+        self.logger.info("A calibration scan has been launched !")
+
+        # Stop the scope from grabbing
+        self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.stop_pb.click()
 
         steps = np.linspace(self.settings.child('calibration', 'calibration_move', 'start').value(),
                             self.settings.child('calibration', 'calibration_move', 'stop').value(),
@@ -213,8 +219,8 @@ class PIDModelLIZARD(PIDModelGeneric):
             self.wait_for_det_done()
 
             raw_spectrum_from_scope = []
-            #raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Lecroy Waverunner_CH000']['data']
-            raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Mock1_CH000']['data']
+            raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Lecroy Waverunner_CH000']['data']
+            #raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Mock1_CH000']['data']
 
             QtWidgets.QApplication.processEvents()
             QThread.msleep(300)
@@ -275,7 +281,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         delay_line_module.move_done_signal.disconnect(self.move_done)
         scope_module.grab_done_signal.disconnect(self.det_done)
 
-        # self.pid_controller.logger.emit('The calibration scan is finished! You can INIT, PLAY and uncheck P
+        self.logger.info("The calibration scan is finished!")
 
     pyqtSlot(str, float)
     def move_done(self, actuator_title, position):
@@ -326,6 +332,38 @@ class PIDModelLIZARD(PIDModelGeneric):
 
         return ellipse_x, ellipse_y
 
+    def get_phi_from_xy(self, x, y):
+        """ Return the angle corresponding to the point (x,y) on the ellipse
+
+        Parameters
+        ----------
+        x: (float) abscissa in a generic frame of reference. We choose it to be the first modulated signal M1
+        y: (float) ordinate in a generic frame of reference. We choose it to be the second modulated signal M2
+
+        Returns
+        -------
+        (float) corresponding angle on the ellipse whose parameters have been set during the calibration scan (in rad)
+        """
+        x0 = self.settings.child('calibration', 'calibration_ellipse', 'x0').value()
+        y0 = self.settings.child('calibration', 'calibration_ellipse', 'y0').value()
+        dx = self.settings.child('calibration', 'calibration_ellipse', 'dx').value()
+        dy = self.settings.child('calibration', 'calibration_ellipse', 'dy').value()
+        theta = np.deg2rad(self.settings.child('calibration', 'calibration_ellipse', 'theta').value())
+
+        # Apply a rotation of -theta to get the ellipse on main axes
+        v = np.array([x, y])
+        rot = np.array([[np.cos(-theta), -np.sin(-theta)],
+                        [np.sin(-theta), np.cos(-theta)]])
+        vprim = rot @ v
+
+        phi = np.arctan2((vprim[1] + x0*np.sin(theta) - y0*np.cos(theta))/dy,
+                         (vprim[0] - x0*np.cos(theta) - y0*np.sin(theta))/dx)
+
+        self.settings.child('stabilization', 'ellipse_phase').setValue(phi)
+        self.ellipse_phase = phi
+
+        return phi
+
     def convert_input(self, data):
         """ Return a measured phase (delay) from the oscilloscope spectrum
 
@@ -342,7 +380,8 @@ class PIDModelLIZARD(PIDModelGeneric):
             zero.
         """
         # Spectrum from the oscilloscope
-        raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Mock1_CH000']['data']
+        # raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Mock1_CH000']['data']
+        raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Lecroy Waverunner_CH000']['data']
 
         scope_viewer = self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.viewers[0]
         # The signal offset is taken from ROI_02 (mean value), which should be out of any electron signal.
@@ -387,8 +426,9 @@ class PIDModelLIZARD(PIDModelGeneric):
 
         Parameters
         ----------
-        phase_correction: (float) output value from the PID module. This phase correction in radians should be within
-        [-pi,+pi].
+        phase_correction : list of floats
+            Output value from the PID module. This phase correction in radians should be within
+        [-pi,+pi]. In this model there is only one PID output, the list contains only one element.
 
         Returns
         -------
@@ -401,15 +441,16 @@ class PIDModelLIZARD(PIDModelGeneric):
         correction_sign = self.settings.child('stabilization', 'correction_sign').value()
 
         # Get the current position of the actuator
-        self.delay_line_absolute_position = self.pid_controller.actuator_modules[0].current_position
+        delay_line_module = self.pid_controller.modules_manager.get_mod_from_name("Delay line", mod="act")
+        self.delay_line_absolute_position = delay_line_module.current_position
 
         absolute_order_to_actuator = (self.delay_line_absolute_position
-                                      + correction_sign*phase_correction*laser_wl/(8*np.pi))
+                                      + correction_sign*phase_correction[0]*laser_wl/(8*np.pi))
 
         self.settings.child('stabilization', 'delay_line_absolute_position').setValue(self.delay_line_absolute_position)
 
         # Get the value of the error (in rad)
-        self.current_setpoint = self.pid_controller.settings.child('main_settings', 'pid_controls', 'set_point').value()
+        self.current_setpoint = self.pid_controller.setpoints[0]
         self.error = self.delay_phase - self.current_setpoint
         self.settings.child('stabilization', 'error').setValue(self.error)
 
@@ -420,4 +461,4 @@ class PIDModelLIZARD(PIDModelGeneric):
 
 
 if __name__ == '__main__':
-    main("BeamSteering.xml")
+    pass
