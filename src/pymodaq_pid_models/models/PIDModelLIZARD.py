@@ -2,16 +2,10 @@ from pymodaq.pid.utils import PIDModelGeneric, OutputToActuator, InputFromDetect
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import QTimer, pyqtSlot, QThread
 from pyqtgraph.dockarea import Dock
-#from pymodaq.daq_utils.daq_utils import linspace_step, check_modules, getLineInfo
-from pymodaq.daq_move.daq_move_main import DAQ_Move
 from pymodaq.daq_utils.plotting.viewer1D.viewer1D_main import Viewer1D
-from pymodaq_plugins.daq_move_plugins.daq_move_Mock import DAQ_Move_Mock
 from pymodaq.daq_utils import math_utils
-from pymodaq.daq_utils.h5modules import H5Saver
 import time
-from datetime import datetime
 import numpy as np
-from collections import OrderedDict
 import logging
 
 
@@ -40,7 +34,7 @@ class PIDModelLIZARD(PIDModelGeneric):
              'children': [
                 {'title': 'Start pos:', 'name': 'start', 'type': 'float', 'value': -10040.},
                 {'title': 'Stop pos:', 'name': 'stop', 'type': 'float', 'value': -10041.},
-                {'title': 'Number of steps:', 'name': 'Nstep', 'type': 'int', 'value': 6},
+                {'title': 'Number of steps:', 'name': 'Nstep', 'type': 'int', 'value': 11},
                 {'title': 'Averaging:', 'name': 'average', 'type': 'int', 'value': 1}]},
             {'title': 'Ellipse params', 'name': 'calibration_ellipse', 'type': 'group', 'expanded': False,
              'visible': True, 'children': [
@@ -64,6 +58,9 @@ class PIDModelLIZARD(PIDModelGeneric):
 
     detectors_name = ["Scope"]
     actuators_name = ["Delay line"]
+
+    setpoints_names = ["Setpoint phase"]
+    Nsetpoints = 1
 
     def __init__(self, pid_controller):
         super().__init__(pid_controller)
@@ -124,11 +121,12 @@ class PIDModelLIZARD(PIDModelGeneric):
         self.logger = logging.getLogger("pymodaq.pid_controller")
 
     def update_settings(self, param):
-        """ Get a parameter instance whose value has been modified by the user on the UI
+        """Get a parameter instance whose value has been modified by the user on the UI
 
         Parameters
         ----------
         param: (Parameter) instance of Parameter object
+
         """
         if param.name() == 'start_calibration':
             if param.value():
@@ -139,12 +137,13 @@ class PIDModelLIZARD(PIDModelGeneric):
                 self.calibration_scan_running = False
 
     def ini_model(self):
-        """ Initialize the PID model
+        """Initialize the PID model
 
         Defines all the action to be performed on the initialized modules (PID parameters, actuators, detectors).
         Either here for specific things (ROI, ...) or within the preset of the current model.
 
         We suppose that the modules have been initialized within the preset.
+
         """
         super().ini_model()
 
@@ -163,12 +162,17 @@ class PIDModelLIZARD(PIDModelGeneric):
 
         # Launch the acquisition of the scope.
         # The name should correspond to the one given in the preset.
-        self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.grab_pb.click()
+        scope_module = self.pid_controller.modules_manager.get_mod_from_name("Scope")
+        scope_module.ui.grab_pb.click()
+
+        # The scope viewer pushbutton Do_math_pb should be checked otherwise the values of the ROIs are not properly
+        # emitted
+        scope_module.viewers[0].ui.Do_math_pb.setChecked(True)
 
         self.logger.info("LIZARD PIDModel initialized")
 
     def start_calibration(self):
-        """ Launch a calibration scan
+        """Launch a calibration scan
 
         This method is called by ticking the "start_calibration" parameter of the UI.
         It should be called after the ROIs have been properly defined.
@@ -179,6 +183,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         set in the parameters and a window displays the result.
         The phase at time zero is also set.
         At the end of the scan the delay line returns to the time zero (the start position).
+
         """
         self.logger.info("A calibration scan has been launched !")
 
@@ -219,8 +224,8 @@ class PIDModelLIZARD(PIDModelGeneric):
             self.wait_for_det_done()
 
             raw_spectrum_from_scope = []
-            raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Lecroy Waverunner_CH000']['data']
-            #raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Mock1_CH000']['data']
+            #raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Lecroy Waverunner_CH000']['data']
+            raw_spectrum_from_scope = scope_module.data_to_save_export['data1D']['Scope_Mock1_CH000']['data']
 
             QtWidgets.QApplication.processEvents()
             QThread.msleep(300)
@@ -285,29 +290,32 @@ class PIDModelLIZARD(PIDModelGeneric):
 
     pyqtSlot(str, float)
     def move_done(self, actuator_title, position):
-        """ Triggered by a signal from the delay line (DAQ_Move object) when it reaches its targeted position
+        """Triggered by a signal from the delay line (DAQ_Move object) when it reaches its targeted position
 
         The move_done_flag is set to False at the begining of each iteration in the calibration loop.
 
         Parameters
         ----------
-        actuator_title: (str) title of the actuator module
-        position: (float) position of the actuator in microns
+        actuator_title : str
+            Title of the actuator module
+        position : float
+            Position of the actuator in microns
+
         """
         self.delay_line_absolute_position = position
         self.move_done_flag = True
 
     pyqtSlot()
     def det_done(self):
-        """ Called each time the oscilloscope finished his acquisition
+        """Called each time the oscilloscope finished his acquisition
 
         The det_done_flag is set to False at the begining of each iteration in the calibration loop.
+
         """
         self.det_done_flag = True
 
     def wait_for_move_done(self):
-        """ Wait for the delay line to have reached its position or timeout
-        """
+        """Wait for the delay line to have reached its position or timeout."""
         self.timeout_scan_flag = False
         self.timer.start(self.settings.child('calibration', 'timeout').value())
         while not(self.move_done_flag or self.timeout_scan_flag):
@@ -315,8 +323,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         self.timer.stop()
 
     def wait_for_det_done(self):
-        """ Wait for the scope to be ready or timeout
-        """
+        """Wait for the scope to be ready or timeout."""
         self.timeout_scan_flag = False
         self.timer.start(self.settings.child('calibration', 'timeout').value())
         while not(self.det_done_flag or self.timeout_scan_flag):
@@ -324,8 +331,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         self.timer.stop()
 
     def get_ellipse_fit(self, center, width, height, theta):
-        """ Construct the arrays to plot the fitted ellipse after the calibration using the ellipse parameters
-        """
+        """Construct the arrays to plot the fitted ellipse after the calibration using the ellipse parameters."""
         t = np.linspace(0, 2*np.pi, 1000)
         ellipse_x = (center[0] + width*np.cos(t)*np.cos(theta) - height*np.sin(t)*np.sin(theta))
         ellipse_y = (center[1] + width*np.cos(t)*np.sin(theta) + height*np.sin(t)*np.cos(theta))
@@ -333,7 +339,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         return ellipse_x, ellipse_y
 
     def get_phi_from_xy(self, x, y):
-        """ Return the angle corresponding to the point (x,y) on the ellipse
+        """Return the angle corresponding to the point (x,y) on the ellipse
 
         Parameters
         ----------
@@ -343,6 +349,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         Returns
         -------
         (float) corresponding angle on the ellipse whose parameters have been set during the calibration scan (in rad)
+
         """
         x0 = self.settings.child('calibration', 'calibration_ellipse', 'x0').value()
         y0 = self.settings.child('calibration', 'calibration_ellipse', 'y0').value()
@@ -365,23 +372,25 @@ class PIDModelLIZARD(PIDModelGeneric):
         return phi
 
     def convert_input(self, data):
-        """ Return a measured phase (delay) from the oscilloscope spectrum
+        """Return a measured phase (delay) from the oscilloscope spectrum
 
         Convert the measurements from the ROIs in the electronic spectrum to a measured phase in rad (same
         dimensionality as the setpoint). The output feeds the PID module (external library).
 
         Parameters
         ----------
-        data: (dict) Dictionary from which the current spectrum is extracted
+        data : dict
+            Dictionary from which the current spectrum is extracted.
 
         Returns
         -------
         (InputFromDetector) Stores the unwrapped phase in radians. The origin of the phase axis is the phase at time
             zero.
+
         """
         # Spectrum from the oscilloscope
-        # raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Mock1_CH000']['data']
-        raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Lecroy Waverunner_CH000']['data']
+        raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Mock1_CH000']['data']
+        #raw_spectrum_from_scope = data['Scope']['data1D']['Scope_Lecroy Waverunner_CH000']['data']
 
         scope_viewer = self.pid_controller.modules_manager.get_mod_from_name("Scope").ui.viewers[0]
         # The signal offset is taken from ROI_02 (mean value), which should be out of any electron signal.
@@ -422,7 +431,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         return InputFromDetector([unwrapped_phase])
 
     def convert_output(self, phase_correction):
-        """ Convert the phase correction from the PID module to an order in absolute value for the actuator.
+        """Convert the phase correction from the PID module to an order in absolute value for the actuator.
 
         Parameters
         ----------
@@ -433,6 +442,7 @@ class PIDModelLIZARD(PIDModelGeneric):
         Returns
         -------
         (OutputToActuator) Stores the absolute value in microns for the piezo actuator.
+
         """
         # Laser wavelength in microns
         laser_wl = self.settings.child('stabilization', 'laser_wl').value()
